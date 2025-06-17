@@ -5,3 +5,13 @@ seaborn
 pyxlsb
 groq
 python-dotenv
+streamlit
+pandas
+matplotlib
+seaborn
+pyxlsb
+groq
+python-dotenv
+openpyxl
+xlrd
+plotly
