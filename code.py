@@ -1,0 +1,228 @@
+from flask import Flask, request
+from twilio.twiml.messaging_response import MessagingResponse
+import os, re, json, requests, pytesseract
+from PIL import Image
+from pdf2image import convert_from_bytes
+from dotenv import load_dotenv
+from io import BytesIO
+import magic  # for MIME detection
+from requests.auth import HTTPBasicAuth
+import logging
+
+load_dotenv()
+
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+
+# 🚗 Load Vehicle Data
+VEHICLE_DATA = {}
+with open("DubaiSampleReponse1.txt", "r") as f:
+    content = f.read()
+    motor_blocks = re.findall(r'"motor":\s*\{(.*?)\}\s*[,\n]', content, re.DOTALL)
+    for block in motor_blocks:
+        block = re.sub(r'(\w+)\s*:', r'"\1":', block)
+        try:
+            data = json.loads("{" + block + "}")
+            reg = data.get("registrationNo")
+            if reg:
+                VEHICLE_DATA[reg] = data
+        except Exception as e:
+            print(" Failed to parse JSON:", e)
+
+# 🧠 Extract intent and vehicle number
+def extract_intent_and_vehicle(msg):
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    prompt = f"""
+    You are Ava, a polite, intelligent, and efficient virtual assistant specializing in vehicle insurance support. Your role is to analyze user WhatsApp messages and extract relevant details to assist with insurance-related queries.
+
+    Please read the message carefully and extract structured information as follows:
+
+    ### TASKS:
+
+    1. **Intent Detection**:
+    Classify the user's intent based on their message content. Choose from:
+    - "greeting": if the message includes general greetings or informal openings.
+    - "accident_report": if the message describes or hints at a vehicle accident, claim, or damage.
+    - "other": for any other queries unrelated to greetings or accident reports.
+
+    2. **Vehicle Number Extraction**:
+    - Identify and extract the vehicle number if it is explicitly mentioned.
+    - If no vehicle number is found, return `"vehicle_number": null`.
+
+    3. **Polite Reply Generation**:
+    - If the vehicle number is missing, include a natural, respectful reply asking the user to provide it.
+    - Keep the tone friendly and professional.
+    - If the vehicle number is provided, leave the reply field empty.
+
+    ### INPUT:
+    Message: "{msg}"
+
+    ### FORMAT:
+    Respond **only** with a valid JSON object in the structure below. No additional text or explanation should be included.
+
+    Example:
+    {
+    "intent": "accident_report",
+    "vehicle_number": "MH12AB1234",
+    "reply": ""
+    }
+
+    If the vehicle number is missing:
+    {
+    "intent": "accident_report",
+    "vehicle_number": null,
+    "reply": "Could you please share your vehicle number so I can assist you further?"
+    }
+
+    Make sure your output is well-formed JSON, with double quotes and proper punctuation.
+    """
+
+    try:
+        body = {
+            "model": "llama3-70b-8192",
+            "messages": [{"role": "system", "content": "You are a vehicle insurance assistant."},
+                         {"role": "user", "content": prompt}],
+            "temperature": 0.2
+        }
+        res = requests.post(GROQ_API_URL, headers=headers, json=body, timeout=30)
+        content = res.json()['choices'][0]['message']['content']
+        return json.loads(re.search(r'\{[\s\S]*\}', content).group(0))
+    except Exception as e:
+        logging.error("Groq error: %s", e)
+        return {"intent": "unknown", "vehicle_number": None, "reply": "Sorry, I couldn't understand your message."}
+
+# 📎 OCR Helper
+def extract_registration_no(text):
+    matches = re.findall(r'\b\d{3,6}\b', text)
+    if not matches:
+        return None
+    for num in matches:
+        if num in VEHICLE_DATA:
+            return num
+    return sorted(matches, key=lambda x: int(x), reverse=True)[0]
+
+def ocr_extract(file_content):
+    text = ""
+    try:
+        mime = magic.from_buffer(file_content, mime=True)
+        if 'pdf' in mime:
+            images = convert_from_bytes(file_content)
+            text = pytesseract.image_to_string(images[0])
+        elif 'image' in mime:
+            img = Image.open(BytesIO(file_content))
+            text = pytesseract.image_to_string(img)
+        else:
+            print(" Unsupported MIME:", mime)
+            return None
+        print(" OCR Text:", text)
+        return extract_registration_no(text)
+    except Exception as e:
+        print(" OCR failed:", e)
+        return None
+
+# 💬 Format vehicle info
+def format_vehicle_info(data):
+    return f"""Vehicle Found:
+
+ Reg No: {data.get("registrationNo")}
+ Make: {data.get("makeDesc")}
+ Model: {data.get("modelDesc")}
+ Accident Count: {data.get("prevAccCount", "0")}
+ Engine No: {data.get("engineNo")}
+ Chassis No: {data.get("chasisNo")}
+"""
+
+# 🛠 Session data
+user_sessions = {}
+
+# WhatsApp Webhook
+@app.route("/whatsapp", methods=["POST"])
+def whatsapp_bot():
+    msg = request.form.get("Body", "").strip()
+    from_number = request.form.get("From")
+    num_media = int(request.form.get("NumMedia", 0))
+    resp = MessagingResponse()
+
+    # 📄 If document uploaded
+    if num_media > 0:
+        media_url = request.form.get("MediaUrl0")
+        try:
+            file_response = requests.get(media_url, auth=HTTPBasicAuth(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+            if file_response.status_code != 200:
+                raise Exception("Failed to download")
+            file_content = file_response.content
+            extracted_reg = ocr_extract(file_content)
+        except Exception as e:
+            print(" File fetch error:", e)
+            resp.message("Couldn't download or read the file. Please try again.")
+            return str(resp)
+
+        stored_data = user_sessions.get(from_number, {}).get("vehicle")
+        if extracted_reg and stored_data and extracted_reg == stored_data.get("registrationNo"):
+            user_sessions[from_number] = {
+                "verified": True,
+                "vehicle": stored_data,
+                "awaiting_location": True
+            }
+            resp.message("We have verified your vehicle details along with the supporting documents provided.\n Could you please provide the location of the accident?")
+        else:
+            resp.message(f"Verification failed.\nExpected: {stored_data.get('registrationNo') if stored_data else 'Unknown'}\nFound: {extracted_reg or 'None'}")
+        return str(resp)
+
+    # 🌍 Handle location if awaiting
+    if from_number in user_sessions and user_sessions[from_number].get("awaiting_location"):
+        user_sessions[from_number]["awaiting_location"] = False
+        location = msg.lower()
+
+        garages = {
+            "dubai": ["Garage One Dubai", "SpeedFix Auto Dubai", "Al Futtaim Auto Repair"],
+            "abu dhabi": ["Capital Auto Garage", "MotorCare Abu Dhabi", "Al Maha Workshop"],
+            "sharjah": ["Sharjah Car Clinic", "AutoMate Garage", "SuperTech Sharjah"],
+            "any": ["Universal Auto Garage", "RapidFix UAE", "TrustAuto Garage"]
+        }
+
+        matched_city = "any"
+        for city in garages:
+            if city in location:
+                matched_city = city
+                break
+
+        suggested = "\n".join([f"- {g}" for g in garages[matched_city]])
+        resp.message(f" Here are some garages near {location.title()}:\n{suggested}\n\nWould you like us to assist with scheduling a pickup or repair?")
+        return str(resp)
+
+    # 🧠 Message handling
+    result = extract_intent_and_vehicle(msg)
+    intent = result.get("intent")
+    vehicle_no = result.get("vehicle_number")
+
+    if intent == "greeting":
+        resp.message(" Hi! Welcome to Vehicle Insurance Assistant.\nHow can I help you today?")
+    elif intent == "accident_report":
+        if vehicle_no and vehicle_no in VEHICLE_DATA:
+            data = VEHICLE_DATA[vehicle_no]
+            user_sessions[from_number] = {
+                "vehicle": data,
+                "verified": False,
+                "awaiting_location": False
+            }
+            resp.message("Sorry to hear about the accident.\n" + format_vehicle_info(data) + "\n\n📎 Please upload your supporting document.")
+        elif vehicle_no:
+            resp.message(f"Couldn't find details for vehicle number {vehicle_no}. Please check again.")
+        else:
+            resp.message(result["reply"])
+    else:
+        resp.message("Please mention your vehicle number or upload a document.")
+
+    return str(resp)
+
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
